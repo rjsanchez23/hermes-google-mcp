@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""
+Servidor MCP (stdio) para Gmail, Calendar y Drive de Google.
+
+Solo librerias estandar. Sin pip, sin node_modules.
+
+Por que existe: los MCP oficiales de Google (gmailmcp/drivemcp/calendarmcp) estan
+en Developer Preview, exigen entrar en un programa con formulario y no documentan
+un flujo OAuth sin pantalla, que es justo el caso de una Raspberry Pi. Este
+servidor usa las APIs de Google en general, que son gratuitas y sin limites
+practicos, y expone herramientas con nombre fijo (importa: el modelo de la Pi es
+pequeno y se pierde con menus dinamicos como el de Composio).
+
+El token vive en credentials/token.json. El cliente MCP (Hermes) nunca ve OAuth.
+"""
+
+import json
+import sys
+import traceback
+
+import gauth
+import tools
+
+PROTOCOL_VERSION = "2024-11-05"
+SERVER_INFO = {"name": "google-workspace", "version": "1.0.0"}
+
+# --------------------------------------------------------------- catalogue
+# Nombres fijos y explicitos. El agente no tiene que "descubrir" nada.
+TOOL_DEFS = [
+    {
+        "name": "gmail_list_labels",
+        "description": "Lista las etiquetas del buzon con totales de mensajes y sin leer. Útil para orientarse antes de buscar.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "gmail_search",
+        "description": "Busca correos con la sintaxis de Gmail. query es obligatorio. Ejemplos: 'is:unread', "
+        "'from:banco after:2026/09/01', 'subject:factura has:attachment', 'in:INBOX is:starred'. "
+        "Devuelve remitente, asunto, fecha y etiquetas (NO el cuerpo).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Consulta con sintaxis de Gmail."},
+                "max_results": {"type": "integer", "description": "Máximo de resultados (1-50). Por defecto 10."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "gmail_get_email",
+        "description": "Lee un correo concreto por su id, incluido el cuerpo en texto plano. "
+        "El mensaje_id se obtiene de gmail_search.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string", "description": "Id del mensaje."}},
+            "required": ["message_id"],
+        },
+    },
+    {
+        "name": "gmail_list_drafts",
+        "description": "Lista los borradores sin enviar, con su texto.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"max_results": {"type": "integer", "description": "Máximo (1-50)."}},
+        },
+    },
+    {
+        "name": "gmail_create_draft",
+        "description": "Crea un BORRADOR y NO envía. Úsalo por defecto para cualquier correo: el usuario "
+        "revisa y envía desde Gmail. Confirma con el usuario el contenido antes de llamar.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Destinatario."},
+                "subject": {"type": "string", "description": "Asunto."},
+                "body": {"type": "string", "description": "Cuerpo del correo."},
+                "cc": {"type": "string", "description": "CC opcional, separado por comas."},
+            },
+            "required": ["to", "subject", "body"],
+        },
+    },
+    {
+        "name": "gmail_send_email",
+        "description": "ENVÍA un correo de verdad. Irreversible: no hay vuelta atrás. "
+        "Muestra al usuario el destinatario, el asunto y el cuerpo, y pide confirmación explícita "
+        "ANTES de llamar. Ante la duda usa gmail_create_draft.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "subject": {"type": "string"},
+                "body": {"type": "string"},
+                "cc": {"type": "string", "description": "CC opcional."},
+            },
+            "required": ["to", "subject", "body"],
+        },
+    },
+    {
+        "name": "gmail_trash_email",
+        "description": "Mueve un correo a la papelera. Reversible 30 días. Muestra antes al usuario "
+        "de qué correo se trata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"}},
+            "required": ["message_id"],
+        },
+    },
+    {
+        "name": "calendar_list_events",
+        "description": "Lista los eventos de los próximos días. Zona horaria Europe/Madrid.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Días a mirar hacia adelante (1-180). Por defecto 7."},
+                "max_results": {"type": "integer", "description": "Máximo de eventos (1-250)."},
+            },
+        },
+    },
+    {
+        "name": "calendar_find_free_slots",
+        "description": "Calcula huecos libres dentro del horario laboral, saltándose lo ocupado. "
+        "Útil para '¿cuándo tengo libre el jueves?'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Días a mirar (1-60). Por defecto 7."},
+                "work_hours": {"type": "string", "description": "Horario laboral 'HH:MM-HH:MM'. Por defecto 09:00-18:00."},
+            },
+        },
+    },
+    {
+        "name": "calendar_create_event",
+        "description": "Crea un evento en el calendario del usuario, EN HORA DE MADRID (Europe/Madrid). "
+        "IMPORTANTE: start y end deben ser ISO 8601 y el offset debe ser el de Madrid en esa fecha: "
+        "+02:00 entre marzo y octubre, +01:00 en invierno. El servidor RECHAZA cualquier otro offset "
+        "con un mensaje que dice cuál corresponde. Si el usuario dice 'mañana a las 10', calcula la "
+        "fecha y aplica el offset correcto; no uses utcnow() ni +00:00. "
+        "Muestra el evento al usuario antes de crearlo.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "Título del evento."},
+                "start": {"type": "string", "description": "ISO 8601 con zona, p.ej. 2026-09-26T20:45:00+02:00"},
+                "end": {"type": "string", "description": "ISO 8601 con zona, posterior a start."},
+                "description": {"type": "string", "description": "Descripción opcional."},
+                "location": {"type": "string", "description": "Lugar opcional."},
+                "attendees": {"type": "string", "description": "Emails separados por comas. OJO: esto ENVÍA invitaciones por correo."},
+            },
+            "required": ["summary", "start", "end"],
+        },
+    },
+    {
+        "name": "calendar_delete_event",
+        "description": "Elimina un evento del calendario. Irreversible. Confirma antes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"event_id": {"type": "string"}},
+            "required": ["event_id"],
+        },
+    },
+    {
+        "name": "drive_search_files",
+        "description": "Busca archivos en Drive por nombre. Sin query lista los modificados recientemente. "
+        "Solo lectura.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Texto a buscar dentro del nombre. Opcional."},
+                "max_results": {"type": "integer", "description": "Máximo (1-100)."},
+            },
+        },
+    },
+    {
+        "name": "drive_read_file",
+        "description": "Lee el contenido de un archivo de Drive. Google Docs se exporta a texto y Google Sheets "
+        "a valores. Solo lectura.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string", "description": "Id del archivo, de drive_search_files o drive_list_folder."},
+                "max_chars": {"type": "integer", "description": "Máximo de caracteres a devolver."},
+            },
+            "required": ["file_id"],
+        },
+    },
+    {
+        "name": "drive_list_folder",
+        "description": "Lista el contenido de una carpeta de Drive. Usa 'root' para la raíz. Solo lectura.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "folder_id": {"type": "string", "description": "Id de carpeta. Por defecto 'root'."},
+                "max_results": {"type": "integer", "description": "Máximo (1-200)."},
+            },
+        },
+    },
+]
+
+DISPATCH = {
+    "gmail_list_labels": lambda a: tools.gmail_list_labels(),
+    "gmail_search": lambda a: tools.gmail_search(a.get("query", ""), a.get("max_results", 10)),
+    "gmail_get_email": lambda a: tools.gmail_get_email(a.get("message_id", "")),
+    "gmail_list_drafts": lambda a: tools.gmail_list_drafts(a.get("max_results", 10)),
+    "gmail_create_draft": lambda a: tools.gmail_create_draft(
+        a.get("to", ""), a.get("subject", ""), a.get("body", ""), a.get("cc", "")
+    ),
+    "gmail_send_email": lambda a: tools.gmail_send_email(
+        a.get("to", ""), a.get("subject", ""), a.get("body", ""), a.get("cc", "")
+    ),
+    "gmail_trash_email": lambda a: tools.gmail_trash_email(a.get("message_id", "")),
+    "calendar_list_events": lambda a: tools.calendar_list_events(a.get("days", 7), a.get("max_results", 25)),
+    "calendar_find_free_slots": lambda a: tools.calendar_find_free_slots(
+        a.get("days", 7), work_hours=a.get("work_hours", "09:00-18:00")
+    ),
+    "calendar_create_event": lambda a: tools.calendar_create_event(
+        a.get("summary", ""), a.get("start", ""), a.get("end", ""),
+        a.get("description", ""), a.get("location", ""), a.get("attendees", ""),
+    ),
+    "calendar_delete_event": lambda a: tools.calendar_delete_event(a.get("event_id", "")),
+    "drive_search_files": lambda a: tools.drive_search_files(a.get("query", ""), a.get("max_results", 20)),
+    "drive_read_file": lambda a: tools.drive_read_file(a.get("file_id", ""), a.get("max_chars", 20000)),
+    "drive_list_folder": lambda a: tools.drive_list_folder(a.get("folder_id", "root"), a.get("max_results", 30)),
+}
+
+
+def log(msg: str) -> None:
+    """ stderr, nunca stdout: stdout es el canal del protocolo MCP. """
+    print(f"[google-workspace] {msg}", file=sys.stderr, flush=True)
+
+
+def send(msg: dict) -> None:
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+
+def ok(req_id, result):
+    send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def err(req_id, code, message):
+    send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+
+
+def handle(req: dict) -> None:
+    method = req.get("method")
+    req_id = req.get("id")
+
+    if method == "initialize":
+        ok(req_id, {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": SERVER_INFO,
+            "instructions": (
+                "Gmail, Calendar y Drive del usuario (javisemaga26@gmail.com). "
+                "Para escribir (enviar correo, crear evento, papelera) muéstrale antes al usuario "
+                "qué vas a hacer y pide confirmación. Ante la duda, gmail_create_draft en vez de enviar. "
+                "Las fechas del calendario van en Europe/Madrid con zona explícita (+02:00 en verano)."
+            ),
+        })
+        return
+
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return
+
+    if method == "ping":
+        ok(req_id, {})
+        return
+
+    if method == "tools/list":
+        ok(req_id, {"tools": TOOL_DEFS})
+        return
+
+    if method == "tools/call":
+        name = (req.get("params") or {}).get("name", "")
+        args = (req.get("params") or {}).get("arguments") or {}
+        fn = DISPATCH.get(name)
+        if not fn:
+            err(req_id, -32602, f"Herramienta desconocida: {name}")
+            return
+        try:
+            result = fn(args)
+            ok(req_id, {
+                "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=1)}],
+                "isError": False,
+            })
+        except gauth.AuthError as e:
+            ok(req_id, {
+                "content": [{"type": "text", "text": f"Error de autorizacion de Google: {e}"}],
+                "isError": True,
+            })
+        except ValueError as e:
+            ok(req_id, {
+                "content": [{"type": "text", "text": f"Argumentos incorrectos: {e}"}],
+                "isError": True,
+            })
+        except Exception as e:
+            log(f"ERROR en {name}: {e}\n{traceback.format_exc()}")
+            ok(req_id, {
+                "content": [{"type": "text", "text": f"Error ejecutando {name}: {type(e).__name__}: {e}"}],
+                "isError": True,
+            })
+        return
+
+    if req_id is not None:
+        err(req_id, -32601, f"Metodo no soportado: {method}")
+
+
+def main() -> None:
+    log(f"arrancado (python {sys.version.split()[0]}); token configurado: {gauth.has_token()}")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as e:
+            log(f"JSON invalido: {e}")
+            continue
+        try:
+            handle(req)
+        except Exception as e:
+            log(f"fallo no controlado: {e}\n{traceback.format_exc()}")
+            if req.get("id") is not None:
+                err(req["id"], -32603, str(e))
+
+
+if __name__ == "__main__":
+    main()

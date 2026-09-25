@@ -51,6 +51,8 @@ WRITE_TOOLS = {
     "gmail_trash_email",
     "calendar_create_event",
     "calendar_delete_event",
+    "drive_create_folder",
+    "drive_write_file",
 }
 
 
@@ -270,6 +272,32 @@ TOOL_DEFS = [
             },
         },
     },
+    {
+        "name": "drive_create_folder",
+        "description": "Crea una carpeta en Drive. Si ya existe con ese nombre, la devuelve sin crear otra. Solo puede crear carpetas nuevas: no puede tocar las que ya tenias.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Nombre de la carpeta."},
+                "parent_id": {"type": "string", "description": "Carpeta donde crearla. Por defecto 'root' (tu Drive)."},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "drive_write_file",
+        "description": "Escribe un archivo de TEXTO en Drive. Si ya existe con ese nombre en esa carpeta, lo actualiza. No hay forma de borrar: el agente deja cosas, no las quita.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Nombre del archivo con extension, p.ej. notas.md o datos.json. SIN carpetas dentro del nombre."},
+                "content": {"type": "string", "description": "El texto a escribir. Es el contenido COMPLETO del archivo, no un parche: si actualizas, incluye todo."},
+                "folder": {"type": "string", "description": "Carpeta de destino: un id, o un nombre (se crea si no existe). Por defecto 'Hermes'."},
+                "description": {"type": "string", "description": "Descripcion opcional del archivo."},
+            },
+            "required": ["name", "content"],
+        },
+    },
 ]
 
 def _lookup_contact(nombre: str) -> dict:
@@ -313,6 +341,13 @@ DISPATCH = {
     "drive_search_files": lambda a: tools.drive_search_files(a.get("query", ""), a.get("max_results", 20)),
     "drive_read_file": lambda a: tools.drive_read_file(a.get("file_id", ""), a.get("max_chars", 20000)),
     "drive_list_folder": lambda a: tools.drive_list_folder(a.get("folder_id", "root"), a.get("max_results", 30)),
+    "drive_create_folder": lambda a: tools.drive_create_folder(
+        a.get("name", ""), a.get("parent_id", "root")
+    ),
+    "drive_write_file": lambda a: tools.drive_write_file(
+        a.get("name", ""), a.get("content", ""), a.get("folder", "Hermes"),
+        a.get("description", "")
+    ),
 }
 
 

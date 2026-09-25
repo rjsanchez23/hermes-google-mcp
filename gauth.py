@@ -42,6 +42,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/drive.readonly",
+    # drive.file = escribir SOLO en los archivos que la propia app crea. No da
+    # permiso para tocar ni borrar los archivos que ya tenia el usuario. Se
+    # juntan los dos: drive.readonly para leer lo que hay, drive.file para
+    # dejar cosas nuevas. El scope completo "drive" incluia tambien BORRAR
+    # cualquier archivo de la cuenta, y no es necesario para esto.
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 SCOPE_STR = " ".join(SCOPES)
@@ -233,3 +239,42 @@ def api_post(url: str, payload: dict) -> dict:
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         raise AuthError(f"API {e.code}: {e.read().decode()[:300]}") from e
+
+
+def api_upload(url: str, content: bytes, content_type: str = "text/plain",
+               metadata: dict = None, method: str = "POST", params=None) -> dict:
+    """Sube contenido a Drive. api_post() solo manda JSON y Drive lo rechaza:
+    para crear un archivo con contenido hace falta multipart/related con la
+    metadata y el cuerpo, o uploadType=media para actualizar solo el contenido.
+
+    Devuelve el dict del archivo. Lanza AuthError con el cuerpo del error de
+    Google, que es donde esta el motivo real (p.ej. 403 insufficient scopes).
+    """
+    boundary = "hermesdrive7f3a9c1e"
+    if metadata is not None:
+        cuerpo = (
+            ("--" + boundary + "\r\n"
+             "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+             + json.dumps(metadata) + "\r\n"
+             "--" + boundary + "\r\n").encode()
+            + b"Content-Type: " + content_type.encode() + b"\r\n\r\n"
+            + content
+            + ("\r\n--" + boundary + "--").encode()
+        )
+        headers = {"Content-Type": "multipart/related; boundary=" + boundary}
+    else:
+        cuerpo = content
+        headers = {"Content-Type": content_type}
+
+    if params:
+        url = url + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        url, data=cuerpo, headers=dict(headers, Authorization="Bearer " + access_token()),
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            raw = resp.read().decode()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raise AuthError(f"API {e.code}: {e.read().decode()[:400]}") from e

@@ -24,6 +24,7 @@ MADRID = ZoneInfo("Europe/Madrid")
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 CAL = "https://www.googleapis.com/calendar/v3"
 DRIVE = "https://www.googleapis.com/drive/v3"
+DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
 
 BASE64_RE = re.compile(r"[^A-Za-z0-9+/=_-]")
 
@@ -676,4 +677,156 @@ def drive_list_folder(folder_id: str = "root", max_results: int = 30) -> dict:
             }
             for f in data.get("files", [])
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Drive: ESCRITURA. Solo con el scope drive.file, que permite crear y modificar
+# archivos que la propia app ha creado, y nada mas. Borrar y mover NO existen
+# a proposito: el agente deja cosas, no limpia el Drive del usuario.
+# ---------------------------------------------------------------------------
+
+_MIME = {
+    ".md": "text/markdown", ".markdown": "text/markdown",
+    ".txt": "text/plain", ".csv": "text/csv", ".tsv": "text/tab-separated-values",
+    ".json": "application/json", ".xml": "application/xml",
+    ".html": "text/html", ".css": "text/css", ".js": "text/javascript",
+    ".py": "text/x-python", ".sh": "text/x-shellscript", ".yaml": "text/yaml",
+    ".yml": "text/yaml", ".sql": "text/x-sql", ".log": "text/plain",
+}
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def _mime_de(nombre: str) -> str:
+    for ext, m in _MIME.items():
+        if str(nombre).lower().endswith(ext):
+            return m
+    return "text/plain"
+
+
+def drive_find_folder(name: str, parent_id: str = "root") -> dict:
+    """Localiza una carpeta por nombre exacto dentro de 'parent_id'."""
+    if not name:
+        raise ValueError("falta el nombre de la carpeta.")
+    esc = name.replace("\\", "\\\\").replace("'", "\\'")
+    data = gauth.api_get(
+        f"{DRIVE}/files",
+        params={
+            "q": f"name = '{esc}' and mimeType = '{FOLDER_MIME}' "
+                 f"and '{parent_id}' in parents and trashed = false",
+            "fields": "files(id,name,webViewLink)",
+            "maxResults": 5,
+        },
+    )
+    archivos = data.get("files", [])
+    return {
+        "nombre": name,
+        "id": archivos[0]["id"] if archivos else "",
+        "enlace": archivos[0].get("webViewLink", "") if archivos else "",
+        "existe": bool(archivos),
+    }
+
+
+def drive_create_folder(name: str, parent_id: str = "root") -> dict:
+    """Crea una carpeta. Si ya existe con ese nombre, la devuelve tal cual en
+    vez de crear otra: dos carpetas con el mismo nombre son ruido."""
+    previa = drive_find_folder(name, parent_id)
+    if previa["existe"]:
+        previa["ya_existia"] = True
+        return previa
+    d = gauth.api_post(
+        f"{DRIVE}/files",
+        {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]},
+    )
+    return {
+        "nombre": d.get("name", name),
+        "id": d.get("id", ""),
+        "enlace": d.get("webViewLink", ""),
+        "existe": True,
+        "ya_existia": False,
+    }
+
+
+def drive_write_file(name: str, content: str, folder: str = "Hermes",
+                     description: str = "") -> dict:
+    """Crea o actualiza un archivo de texto.
+
+    'folder' admite un id de carpeta o un nombre. Si es un nombre y no existe,
+    la crea. Todo lo que escribe el agente cae ahi dentro, para no repartir
+    archivos por el Drive del usuario.
+
+    Si el archivo ya existe, lo ACTUALIZA, pero solo si lo creo la app. Con el
+    scope drive.file, un archivo del usuario simplemente da 403 al intentar
+    tocarlo, y eso se reporta con un mensaje claro en vez de un error generico.
+    """
+    if not name:
+        raise ValueError("falta el 'name' del archivo (p.ej. notas.md).")
+    if content is None:
+        raise ValueError("falta el 'content'.")
+    if "/" in name or name in (".", ".."):
+        raise ValueError(
+            "'name' es solo el nombre del archivo, sin carpetas. "
+            "Usa 'folder' para decidir donde se guarda."
+        )
+
+    # Resolver carpeta: id si parece un id, nombre -> buscar o crear.
+    if re.fullmatch(r"[A-Za-z0-9_-]{20,}", folder or ""):
+        folder_id, folder_nombre = folder, "(id directo)"
+    else:
+        carpeta = drive_create_folder(folder or "Hermes")
+        folder_id, folder_nombre = carpeta["id"], carpeta["nombre"]
+
+    esc = name.replace("\\", "\\\\").replace("'", "\\'")
+    previo = gauth.api_get(
+        f"{DRIVE}/files",
+        params={
+            "q": f"name = '{esc}' and '{folder_id}' in parents and trashed = false",
+            "fields": "files(id,name,modifiedTime,webViewLink)",
+            "maxResults": 1,
+        },
+    ).get("files", [])
+
+    cuerpo = str(content).encode("utf-8")
+    mime = _mime_de(name)
+
+    if previo:
+        try:
+            d = gauth.api_upload(
+                DRIVE_UPLOAD + "/" + previo[0]["id"], cuerpo, mime, method="PATCH"
+            )
+        except gauth.AuthError as exc:
+            if "403" in str(exc):
+                raise gauth.AuthError(
+                    "No puedo escribir en '%s': ese archivo ya existia y no lo creo la "
+                    "aplicacion, asi que el permiso drive.file no me deja tocarlo. Es "
+                    "a proposito. Usa otro nombre, o pidele al usuario que lo comparta "
+                    "con la aplicacion. Detalle: %s" % (name, str(exc)[:160])
+                ) from exc
+            raise
+        return {
+            "accion": "actualizado",
+            "nombre": d.get("name", name),
+            "id": d.get("id"),
+            "carpeta": folder_nombre,
+            "enlace": d.get("webViewLink", ""),
+            "bytes": len(cuerpo),
+            "tipo": mime,
+        }
+
+    d = gauth.api_upload(
+        DRIVE_UPLOAD,
+        cuerpo,
+        mime,
+        metadata={"name": name, "parents": [folder_id], "description": description},
+        params={"uploadType": "multipart", "fields": "id,name,webViewLink"},
+    )
+    return {
+        "accion": "creado",
+        "nombre": d.get("name", name),
+        "id": d.get("id"),
+        "carpeta": folder_nombre,
+        "enlace": d.get("webViewLink", ""),
+        "bytes": len(cuerpo),
+        "tipo": mime,
     }

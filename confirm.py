@@ -112,12 +112,44 @@ def correo_papelera(r: dict) -> str:
     ])
 
 
+def archivo_escrito(r: dict) -> str:
+    verbos = {"creado": "Archivo creado en Google Drive.", "actualizado": "Archivo actualizado en Google Drive."}
+    kb = r.get("bytes", 0) / 1024.0
+    return "\n".join([
+        verbos.get(r.get("accion", ""), "Archivo escrito en Google Drive."),
+        "",
+        "Nombre: %s" % r.get("nombre", "?"),
+        "Carpeta: %s" % r.get("carpeta", "?"),
+        "Tamano: %s" % ("%.1f KB" % kb),
+        "Enlace: %s" % r.get("enlace", "?"),
+        "",
+        "Ojo: 'content' es el contenido COMPLETO. Si has actualizado, ese",
+        "archivo ahora tiene EXACTAMENTE lo que mandaste, no se anade al previo.",
+        "",
+        "Recibo: %s" % r.get("_recibo", "SIN RECIBO"),
+    ])
+
+
+def carpeta_creada(r: dict) -> str:
+    cabecera = "Carpeta ya existia en Drive." if r.get("ya_existia") else "Carpeta creada en Google Drive."
+    return "\n".join([
+        cabecera,
+        "",
+        "Nombre: %s" % r.get("nombre", "?"),
+        "Enlace: %s" % r.get("enlace", "?"),
+        "",
+        "Recibo: %s" % r.get("_recibo", "SIN RECIBO"),
+    ])
+
+
 REDACTORES = {
     "calendar_create_event": evento_creado,
     "calendar_delete_event": evento_borrado,
     "gmail_send_email": correo_enviado,
     "gmail_create_draft": borrador_creado,
     "gmail_trash_email": correo_papelera,
+    "drive_write_file": archivo_escrito,
+    "drive_create_folder": carpeta_creada,
 }
 
 

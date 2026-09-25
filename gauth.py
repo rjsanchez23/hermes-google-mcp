@@ -205,13 +205,23 @@ def access_token() -> str:
     return fresh["access_token"]
 
 
-def api_get(url: str, params=None) -> dict:
+def api_get(url: str, params=None, raw: bool = False):
+    """GET a la API. Por defecto devuelve el JSONparseado; con raw=True devuelve
+    el texto tal cual.
+
+    Necesario para Drive: descargar el contenido de un archivo se pide con
+    alt=media, y la respuesta es el archivo en crudo, no JSON. Sin esto,
+    json.loads reventaba con "Expecting value" y drive_read_file no habia
+    funcionado nunca con archivos de texto."""
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + access_token()})
     try:
         with urllib.request.urlopen(req, timeout=45) as resp:
-            return json.loads(resp.read().decode())
+            cuerpo = resp.read().decode("utf-8", "replace")
+            if raw:
+                return cuerpo
+            return json.loads(cuerpo)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             # access_token caducado por surprise: fuerza refresco y reintenta una vez

@@ -648,7 +648,8 @@ def drive_read_file(file_id: str, max_chars: int = 20000) -> dict:
         out["tipo_exportado"] = "valores de hoja"
         return out
 
-    d = gauth.api_get(f"{DRIVE}/files/{urllib.parse.quote(file_id)}", params={"alt": "media"})
+    # alt=media devuelve el contenido en crudo, no JSON: hay que pedir raw=True.
+    d = gauth.api_get(f"{DRIVE}/files/{urllib.parse.quote(file_id)}", params={"alt": "media"}, raw=True)
     if isinstance(d, str):
         out["contenido"] = d[:max_chars]
     else:

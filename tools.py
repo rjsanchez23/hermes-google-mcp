@@ -310,10 +310,95 @@ def calendar_find_free_slots(days: int = 7, calendar_id: str = "primary", work_h
     return {"calendario": calendar_id, "horario": work_hours, "huecos_libres": free[:40]}
 
 
-_DIAS = {"lunes": "MO", "martes": "TU", "miercoles": "WE", "jueves": "TH",
-         "viernes": "FR", "sabado": "SA", "domingo": "SU",
-         "mon": "MO", "tue": "TU", "wed": "WE", "thu": "TH",
-         "fri": "FR", "sat": "SA", "sun": "SU"}
+# Coincidencia EXACTA de palabra, nunca por prefijo. Se intento lo contrario y
+# fue un desastre: "los" -> lunes, "solo" -> sabado, "semanas" -> sabado,
+# "de" -> domingo, "vez" -> viernes. Un prefijo de dos letras casa con cualquier
+# palabra castellana, y ahi se cuelan dias que el usuario no ha pedido.
+# Solo se aceptan las formas que estan escritas aqui, una a una.
+_DIA_PALABRA = {
+    # Castellano, singular y plural
+    "lunes": "MO", "martes": "TU", "miercoles": "WE", "jueves": "TH",
+    "viernes": "FR", "sabado": "SA", "domingo": "SU",
+    "sabados": "SA", "domingos": "SU",
+    # Castellano, abreviaturas que se usan al escribir
+    "lun": "MO", "mar": "TU", "mie": "WE", "mier": "WE", "mi": "WE",
+    "jue": "TH", "ju": "TH", "vie": "FR", "vier": "FR", "sab": "SA",
+    "dom": "SU",
+    # Ingles
+    "monday": "MO", "tuesday": "TU", "wednesday": "WE", "thursday": "TH",
+    "friday": "FR", "saturday": "SA", "sunday": "SU",
+    "mon": "MO", "tue": "TU", "wed": "WE", "thu": "TH",
+    "fri": "FR", "sat": "SA", "sun": "SU",
+}
+
+# Letras sueltas: convencion espanola, M es MARTES y X es MIERCOLES.
+_LETRA = {"l": "MO", "m": "TU", "x": "WE", "j": "TH", "v": "FR", "s": "SA", "d": "SU"}
+
+# Codigos RRULE de Google, que llegan en mayusculas: "MO-WE-FR", "MO,WE,FR".
+_CODIGO = {"MO": "MO", "TU": "TU", "WE": "WE", "TH": "TH",
+           "FR": "FR", "SA": "SA", "SU": "SU"}
+
+# Conectores de rango. OJO: "y" NO es conector. "lunes, miercoles y viernes" son
+# tres dias sueltos; si "y" uniera el rango, miercoles-viernes se expandiria a
+# jueves y apareceria un dia que nadie pidio.
+_RANGO = ("a", "al", "hasta")
+
+_ORDEN = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+
+
+def _token_a_dia(token: str):
+    """Un token -> codigo de dia, o None si no es un dia. Nunca adivina."""
+    if token in _CODIGO:            # "MO" en mayusculas, codigo RRULE
+        return _CODIGO[token]
+    bajo = _sin_tildes(token.lower())
+    if bajo in _DIA_PALABRA:
+        return _DIA_PALABRA[bajo]
+    if len(bajo) == 1 and bajo in _LETRA:
+        return _LETRA[bajo]
+    return None
+
+
+def _dias_de(frase: str) -> list:
+    """Dias citados, en orden natural de semana y sin repetir.
+
+    Estricto: si no reconoce nada devuelve [] en vez de adivinar. Devolver dias
+    equivocados en silencio es peor que no devolver nada, porque el evento se crea
+    con la recurrencia equivocada y el aviso de "no se aplico" no salta.
+    """
+    crudo = str(frase)
+    # Los codigos RRULE ("MO,WE,FR") se buscan ANTES de pasar a minuscula.
+    codigos = [t for t in re.findall(r"[A-Za-z]+", crudo) if t in _CODIGO]
+    dias = []
+    for t in codigos:
+        if _CODIGO[t] not in dias:
+            dias.append(_CODIGO[t])
+    if dias:
+        return sorted(dias, key=_ORDEN.index)
+
+    limpio = _sin_tildes(crudo.lower())
+    tokens = re.findall(r"[a-z]+", limpio)
+    codigos_de = [_token_a_dia(t) for t in tokens]
+
+    for d in codigos_de:
+        if d and d not in dias:
+            dias.append(d)
+
+    # Rangos: "de lunes a viernes" -> los cinco dias laborables.
+    for i in range(len(tokens) - 2):
+        if tokens[i + 1] not in _RANGO:
+            continue
+        a, b = codigos_de[i], codigos_de[i + 2]
+        if a and b and _ORDEN.index(a) < _ORDEN.index(b):
+            for d in _ORDEN[_ORDEN.index(a):_ORDEN.index(b) + 1]:
+                if d not in dias:
+                    dias.append(d)
+
+    return sorted(dias, key=_ORDEN.index)
+
+
+def _sin_tildes(x: str) -> str:
+    import unicodedata as _ud
+    return "".join(c for c in _ud.normalize("NFD", x) if _ud.category(c) != "Mn")
 
 
 def _rrule(spec: str) -> str:
@@ -328,54 +413,40 @@ def _rrule(spec: str) -> str:
     despues se extraen los modificadores (hasta / N veces / cada N) SIN mutilar el
     resto, y solo entonces se buscan los dias.
     """
-    import re as _re
-    import unicodedata as _ud
-
-    s = str(spec or "").strip().lower()
-    if not s:
+    crudo = str(spec or "").strip()
+    if not crudo:
         return ""
+    s = crudo.lower()
 
-    def _sin_tildes(x):
-        return "".join(c for c in _ud.normalize("NFD", x) if _ud.category(c) != "Mn")
-
-    # Frases que niegan: antes de quitar tildes, para no dejar media palabra.
+    # Frases que niegan
     limpio = _sin_tildes(s)
-    if _re.search(r"\bsin\b|\bno\b|\bnunca\b|\bninguno\b", limpio):
+    if re.search(r"\bsin\b|\bno\b|\bnunca\b|\bninguno\b", limpio):
         return ""
     s = limpio
 
     hasta = ""
-    m = _re.search(r"(?:hasta|hasta el|until)\s+(\d{4}-\d{2}-\d{2})", s)
+    m = re.search(r"(?:hasta|hasta el|until)\s+(\d{4}-\d{2}-\d{2})", s)
     if m:
         hasta = ";UNTIL=" + m.group(1).replace("-", "") + "T235959Z"
         s = s[:m.start()] + " " + s[m.end():]
 
     total = ""
-    m = _re.search(r"(\d+)\s*(?:veces|repeticiones|repeticiones|ociones)", s)
+    m = re.search(r"(\d+)\s*(?:veces|repeticiones|repeticiones)", s)
     if m:
         total = ";COUNT=" + m.group(1)
         s = s[:m.start()] + " " + s[m.end():]
 
     cada = ""
-    m = _re.search(r"cada\s+(\d+)\s*(?:semana|semanas|dia|dias)", s)
+    m = re.search(r"cada\s+(\d+)\s*(?:semanas|semana|dias|dia)", s)
     if m:
         n = int(m.group(1))
         cada = ";INTERVAL=" + str(n) if n > 1 else ""
         s = s[:m.start()] + " " + s[m.end():]
 
-    if _re.search(r"\b(diario?|todos los dias|every day)\b", s):
+    if re.search(r"\b(diario?|todos los dias|every day)\b", s):
         return "FREQ=DAILY" + cada + total + hasta
 
-    dias = []
-    for nombre, code in _DIAS.items():
-        if _re.search(r"\b" + nombre + r"\b", s) and code not in dias:
-            dias.append(code)
-    if not dias:
-        letras = _re.findall(r"[lmtjvsx]", s)
-        mapa = {"l": "MO", "m": "TU", "x": "WE", "j": "TH", "v": "FR", "s": "SA", "d": "SU"}
-        for letra in letras:
-            if letra in mapa and mapa[letra] not in dias:
-                dias.append(mapa[letra])
+    dias = _dias_de(crudo)
     if not dias:
         return ""
     return "FREQ=WEEKLY;BYDAY=" + ",".join(dias) + cada + total + hasta
@@ -460,6 +531,25 @@ def calendar_create_event(
         body["attendees"] = [{"email": a} for a in emails]
 
     rrule = _rrule(repeat)
+    if repeat and not rrule:
+        # Fallo SILENCIOSO: el usuario pidio repeticion y el parser no la entendio.
+        # Antes se creaba el evento como una sesion y el usuario se enteraba
+        # tres dias despues, al no aparecer el miercoles. Ahora se para y lo dice.
+        return {
+            "error": "No entiendo la repeticion que has pedido y NO he creado el evento.",
+            "repeticion_no_entendida": repeat,
+            "formatos_validos": [
+                "todos los lunes, miercoles y viernes",
+                "lunes miercoles viernes",
+                "todos los dias",
+                "cada 2 semanas los martes",
+                "todos los lunes hasta 2026-12-31",
+                "6 veces los lunes",
+                "de lunes a viernes",
+                "L-M-X-V",
+            ],
+            "que_hacer": "Repite la peticion con alguno de estos formatos, o pregunta al usuario cual queria. NO crees el evento sin repeticion ni lo repartas en varios eventos sueltos.",
+        }
     if rrule:
         body["recurrence"] = ["RRULE:" + rrule]
 

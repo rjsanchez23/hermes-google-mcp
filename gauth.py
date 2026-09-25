@@ -39,6 +39,12 @@ TOKEN_URI = "https://oauth2.googleapis.com/token"
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
+    # gmail.modify = mover a la papelera, archivar, etiquetar. SIN ESTE no se
+    # puede limpiar la bandeja: gmail.readonly y gmail.compose no llegan.
+    # OJO: tambien habilita el borrado definitivo. No hay ninguna herramienta
+    # de borrado en el MCP a proposito, asi que la capacidad existe en el token
+    # pero no hay por donde usarla.
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/drive.readonly",

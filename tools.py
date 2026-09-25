@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
+import contacts
 import gauth
 
 # El usuario es de Espana: TODO el calendario va en hora de Madrid, sin excepcion.
@@ -194,11 +195,22 @@ def _extract_text(m: dict) -> str:
 
 
 def calendar_list_events(days: int = 7, max_results: int = 25, calendar_id: str = "primary") -> dict:
+    """Lista eventos de HOY a hoy+days.
+
+    timeMin se trunca a MEDIANOCHE de hoy (Madrid), no a la hora actual. Con
+    datetime.now() el rango empezaba a las 21:48, asi que un evento de las 20:45
+    de manana quedaba FUERA y la herramienta devolia 0 eventos: hacia pensar que
+    no estaba creado cuando si estaba. Empezar por el inicio del dia completo.
+    """
     import datetime
 
     days = max(1, min(int(days), 180))
-    now = datetime.datetime.now(datetime.timezone.utc)
-    end = now + datetime.timedelta(days=days)
+    # Inicio de HOY en Madrid, no este instante. Asi "hoy" incluye lo que ya ha
+    # empezado, que es justo lo que el usuario quiere ver.
+    hoy = datetime.datetime.now(MADRID).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = hoy.astimezone(datetime.timezone.utc)
+    end = hoy + datetime.timedelta(days=days)
+    now = start
     data = gauth.api_get(
         f"{CAL}/calendars/{urllib.parse.quote(calendar_id)}/events",
         params={
@@ -298,6 +310,77 @@ def calendar_find_free_slots(days: int = 7, calendar_id: str = "primary", work_h
     return {"calendario": calendar_id, "horario": work_hours, "huecos_libres": free[:40]}
 
 
+_DIAS = {"lunes": "MO", "martes": "TU", "miercoles": "WE", "jueves": "TH",
+         "viernes": "FR", "sabado": "SA", "domingo": "SU",
+         "mon": "MO", "tue": "TU", "wed": "WE", "thu": "TH",
+         "fri": "FR", "sat": "SA", "sun": "SU"}
+
+
+def _rrule(spec: str) -> str:
+    """Convierte texto en un RRULE de Google Calendar.
+
+    Acepta cosas como "todos los lunes, miercoles y viernes", "todos los dias",
+    "cada 2 semanas los martes", "lunes hasta 2026-12-31", "6 veces los lunes",
+    "L-M-X-V". Devuelve "" si no entiende la frase (mejor no repetir que repetir
+    mal).
+
+    Orden importante: primero se quitan tildes y se limpian las frases negativas,
+    despues se extraen los modificadores (hasta / N veces / cada N) SIN mutilar el
+    resto, y solo entonces se buscan los dias.
+    """
+    import re as _re
+    import unicodedata as _ud
+
+    s = str(spec or "").strip().lower()
+    if not s:
+        return ""
+
+    def _sin_tildes(x):
+        return "".join(c for c in _ud.normalize("NFD", x) if _ud.category(c) != "Mn")
+
+    # Frases que niegan: antes de quitar tildes, para no dejar media palabra.
+    limpio = _sin_tildes(s)
+    if _re.search(r"\bsin\b|\bno\b|\bnunca\b|\bninguno\b", limpio):
+        return ""
+    s = limpio
+
+    hasta = ""
+    m = _re.search(r"(?:hasta|hasta el|until)\s+(\d{4}-\d{2}-\d{2})", s)
+    if m:
+        hasta = ";UNTIL=" + m.group(1).replace("-", "") + "T235959Z"
+        s = s[:m.start()] + " " + s[m.end():]
+
+    total = ""
+    m = _re.search(r"(\d+)\s*(?:veces|repeticiones|repeticiones|ociones)", s)
+    if m:
+        total = ";COUNT=" + m.group(1)
+        s = s[:m.start()] + " " + s[m.end():]
+
+    cada = ""
+    m = _re.search(r"cada\s+(\d+)\s*(?:semana|semanas|dia|dias)", s)
+    if m:
+        n = int(m.group(1))
+        cada = ";INTERVAL=" + str(n) if n > 1 else ""
+        s = s[:m.start()] + " " + s[m.end():]
+
+    if _re.search(r"\b(diario?|todos los dias|every day)\b", s):
+        return "FREQ=DAILY" + cada + total + hasta
+
+    dias = []
+    for nombre, code in _DIAS.items():
+        if _re.search(r"\b" + nombre + r"\b", s) and code not in dias:
+            dias.append(code)
+    if not dias:
+        letras = _re.findall(r"[lmtjvsx]", s)
+        mapa = {"l": "MO", "m": "TU", "x": "WE", "j": "TH", "v": "FR", "s": "SA", "d": "SU"}
+        for letra in letras:
+            if letra in mapa and mapa[letra] not in dias:
+                dias.append(mapa[letra])
+    if not dias:
+        return ""
+    return "FREQ=WEEKLY;BYDAY=" + ",".join(dias) + cada + total + hasta
+
+
 def _hint(start: str) -> str:
     """Devuelve un ejemplo de fecha ISO con el offset de Madrid correcto."""
     import datetime as _dt
@@ -318,6 +401,7 @@ def calendar_create_event(
     location: str = "",
     attendees: str = "",
     calendar_id: str = "primary",
+    repeat: str = "",
 ) -> dict:
     """Crea un evento. 'start' y 'end' en ISO 8601 con zona, p.ej.
     2026-09-26T20:45:00+02:00. 'attendees' es una lista de emails separada
@@ -364,9 +448,20 @@ def calendar_create_event(
         body["description"] = description
     if location:
         body["location"] = location
-    emails = [a.strip() for a in (attendees or "").split(",") if "@" in a]
+    # Resolver NOMBRES a emails con el directorio local. "Eli" -> su direccion.
+    # Sin esto el agente tenia que recordar el email y acababa pidiendotelo.
+    emails, resueltos, sin_resolver = contacts.resolver_lista(attendees)
+    if sin_resolver:
+        raise ValueError(
+            "No encuentro el contacto: %s. Conocidos: %s. O escribe el email completo."
+            % (", ".join(sin_resolver), ", ".join(contacts.cargar().keys()) or "(directorio vacio)")
+        )
     if emails:
         body["attendees"] = [{"email": a} for a in emails]
+
+    rrule = _rrule(repeat)
+    if rrule:
+        body["recurrence"] = ["RRULE:" + rrule]
 
     d = gauth.api_post(f"{CAL}/calendars/{urllib.parse.quote(calendar_id)}/events", body)
     return {
@@ -376,6 +471,8 @@ def calendar_create_event(
         "inicio": body["start"]["dateTime"],
         "fin": body["end"]["dateTime"],
         "invitados": emails,
+        "invitados_resueltos": resueltos,
+        "recurrencia": ("RRULE:" + rrule) if rrule else "",
         "status": "evento creado",
     }
 

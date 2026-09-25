@@ -20,11 +20,24 @@ import os
 import sys
 import traceback
 
+import contacts
 import gauth
+import confirm
 import tools
 
+CONTACT_TOOL = {
+    "name": "contact_lookup",
+    "description": "Mira un contacto guardado y devuelve su email. Úsalo cuando el usuario nombre a "
+    "alguien para un evento o un correo: el agente no tiene que acordarse de los emails. "
+    "Sin argumentos, lista todos los contactos conocidos.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"name": {"type": "string", "description": "Nombre del contacto. Opcional."}},
+    },
+}
+
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "google-workspace", "version": "1.1.0"}
+SERVER_INFO = {"name": "google-workspace", "version": "1.2.0"}
 
 # Rastro de acciones. El agente ha dicho "ya está guardado" tres veces sin haber
 # llamado a ninguna herramienta. Con este log, cualquier afirmación suya se
@@ -85,6 +98,7 @@ def _redact(args: dict) -> dict:
 # --------------------------------------------------------------- catalogue
 # Nombres fijos y explicitos. El agente no tiene que "descubrir" nada.
 TOOL_DEFS = [
+    CONTACT_TOOL,
     {
         "name": "gmail_list_labels",
         "description": "Lista las etiquetas del buzon con totales de mensajes y sin leer. Útil para orientarse antes de buscar.",
@@ -125,7 +139,7 @@ TOOL_DEFS = [
     {
         "name": "gmail_create_draft",
         "description": "Crea un BORRADOR y NO envía. Úsalo por defecto para cualquier correo: el usuario "
-        "revisa y envía desde Gmail. Confirma con el usuario el contenido antes de llamar.",
+        "Revisalo y envialo tu. La respuesta trae _confirmacion: copiala literal.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -139,9 +153,9 @@ TOOL_DEFS = [
     },
     {
         "name": "gmail_send_email",
-        "description": "ENVÍA un correo de verdad. Irreversible: no hay vuelta atrás. "
-        "Muestra al usuario el destinatario, el asunto y el cuerpo, y pide confirmación explícita "
-        "ANTES de llamar. Ante la duda usa gmail_create_draft.",
+        "description": "ENVÍA un correo de verdad. Irreversible. "
+        "Muestra destinatario, asunto y cuerpo, y pide confirmacion ANTES de llamar. "
+        "La respuesta trae _confirmacion: copiala literal. Ante la duda, gmail_create_draft.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -155,8 +169,8 @@ TOOL_DEFS = [
     },
     {
         "name": "gmail_trash_email",
-        "description": "Mueve un correo a la papelera. Reversible 30 días. Muestra antes al usuario "
-        "de qué correo se trata.",
+        "description": "Mueve un correo a la papelera. Reversible 30 dias. "
+        "La respuesta trae _confirmacion: copiala literal.",
         "inputSchema": {
             "type": "object",
             "properties": {"message_id": {"type": "string"}},
@@ -193,7 +207,9 @@ TOOL_DEFS = [
         "+02:00 entre marzo y octubre, +01:00 en invierno. El servidor RECHAZA cualquier otro offset "
         "con un mensaje que dice cuál corresponde. Si el usuario dice 'mañana a las 10', calcula la "
         "fecha y aplica el offset correcto; no uses utcnow() ni +00:00. "
-        "Muestra el evento al usuario antes de crearlo.",
+        "MUESTRA al usuario titulo, fecha y hora ANTES de crearlo y pide confirmacion. "
+        "Al ejecutarla, la respuesta trae _confirmacion: REENVIA ESE TEXTO TAL CUAL, "
+        "sin reescribirlo ni resumirlo, porque lo ha generado el servidor con los datos reales.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -202,14 +218,16 @@ TOOL_DEFS = [
                 "end": {"type": "string", "description": "ISO 8601 con zona, posterior a start."},
                 "description": {"type": "string", "description": "Descripción opcional."},
                 "location": {"type": "string", "description": "Lugar opcional."},
-                "attendees": {"type": "string", "description": "Emails separados por comas. OJO: esto ENVÍA invitaciones por correo."},
+                "attendees": {"type": "string", "description": "Nombres o emails separados por comas. Los NOMBRES se resuelven solos con el directorio de contactos (p.ej. 'Eli'). Poner a alguien como invitado NO le manda ningun correo: queda pendiente hasta que lo acepta."},
+                "repeat": {"type": "string", "description": "Opcional. Recurrencia en palabras: 'todos los lunes, miercoles y viernes', 'todos los dias', 'cada 2 semanas los martes', 'todos los lunes hasta 2026-12-31', '6 veces los lunes', 'L-M-X-V'. Crea UN solo evento que se repite, no uno por sesion. Si no se dice nada, no se repite."},
             },
             "required": ["summary", "start", "end"],
         },
     },
     {
         "name": "calendar_delete_event",
-        "description": "Elimina un evento del calendario. Irreversible. Confirma antes.",
+        "description": "Elimina un evento del calendario. Irreversible. Confirma antes. "
+        "La respuesta trae _confirmacion: copiala literal.",
         "inputSchema": {
             "type": "object",
             "properties": {"event_id": {"type": "string"}},
@@ -254,7 +272,24 @@ TOOL_DEFS = [
     },
 ]
 
+def _lookup_contact(nombre: str) -> dict:
+    email, via = contacts.resolver(nombre)
+    if email:
+        return {"nombre": nombre, "email": email, "resuelto_por": via}
+    return {
+        "nombre": nombre,
+        "email": None,
+        "error": "No hay ningun contacto con ese nombre.",
+        "contactos_conocidos": list(contacts.cargar().keys()),
+    }
+
+
 DISPATCH = {
+    "contact_lookup": lambda a: (
+        {"contactos": contacts.cargar()}
+        if not a.get("name")
+        else _lookup_contact(a.get("name", ""))
+    ),
     "gmail_list_labels": lambda a: tools.gmail_list_labels(),
     "gmail_search": lambda a: tools.gmail_search(a.get("query", ""), a.get("max_results", 10)),
     "gmail_get_email": lambda a: tools.gmail_get_email(a.get("message_id", "")),
@@ -343,11 +378,13 @@ def handle(req: dict) -> None:
                 if isinstance(result, dict):
                     result = dict(result)
                     result["_recibo"] = rid
-                    result["_como_usar"] = (
-                        "Copia este _recibo literal en tu respuesta. Es la unica prueba "
-                        "de que la accion ocurrio de verdad. Si no tienes un _recibo, "
-                        "NO la has hecho: no digas que si."
-                    )
+                    # El texto lo escribe el servidor, no el modelo. El agente no
+                    # puede inventar duraciones ni ubicaciones porque no redacta:
+                    # solo copia este bloque. _confirmacion es la UNICA fuente de
+                    # verdad sobre lo que se ha hecho.
+                    oficial = confirm.redactar(name, result)
+                    if oficial:
+                        result["_confirmacion"] = oficial
             ok(req_id, {
                 "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=1)}],
                 "isError": False,

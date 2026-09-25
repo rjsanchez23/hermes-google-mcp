@@ -114,13 +114,16 @@ def correo_papelera(r: dict) -> str:
 
 def archivo_escrito(r: dict) -> str:
     verbos = {"creado": "Archivo creado en Google Drive.", "actualizado": "Archivo actualizado en Google Drive."}
-    kb = r.get("bytes", 0) / 1024.0
+    # Un archivo de 17 bytes salia como "Tamano: 0.0 KB", que parece un fallo y
+    # invita al modelo a reescribir el bloque. Bytes si es pequeno, KB si no.
+    b = int(r.get("bytes", 0) or 0)
+    tam = "%d bytes" % b if b < 1024 else "%.1f KB" % (b / 1024.0)
     return "\n".join([
         verbos.get(r.get("accion", ""), "Archivo escrito en Google Drive."),
         "",
         "Nombre: %s" % r.get("nombre", "?"),
         "Carpeta: %s" % r.get("carpeta", "?"),
-        "Tamano: %s" % ("%.1f KB" % kb),
+        "Tamano: %s" % tam,
         "Enlace: %s" % r.get("enlace", "?"),
         "",
         "Ojo: 'content' es el contenido COMPLETO. Si has actualizado, ese",

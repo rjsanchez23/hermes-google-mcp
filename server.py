@@ -251,10 +251,11 @@ def handle(req: dict) -> None:
             "capabilities": {"tools": {}},
             "serverInfo": SERVER_INFO,
             "instructions": (
-                "Gmail, Calendar y Drive del usuario (javisemaga26@gmail.com). "
+                "Gmail, Calendar y Drive del usuario (rjsemaga@gmail.com). "
                 "Para escribir (enviar correo, crear evento, papelera) muéstrale antes al usuario "
                 "qué vas a hacer y pide confirmación. Ante la duda, gmail_create_draft en vez de enviar. "
-                "Las fechas del calendario van en Europe/Madrid con zona explícita (+02:00 en verano)."
+                "Las fechas del calendario van en Europe/Madrid con zona explícita (+02:00 en verano, "
+                "+01:00 en invierno); calendar_create_event rechaza cualquier otro offset."
             ),
         })
         return

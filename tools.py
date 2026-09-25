@@ -29,9 +29,14 @@ BASE64_RE = re.compile(r"[^A-Za-z0-9+/=_-]")
 
 
 def gmail_list_labels() -> dict:
-    data = gauth.api_get(f"{GMAIL}/labels")
-    return {
-        "labels": [
+    # Sin includeAttributes=false, la respuesta trae atributos por etiqueta que
+    # solo hacen ruido. Los contadores (messagesTotal/messagesUnread) los mete
+    # labels.list cuando se piden con includeDetails via el recurso de etiqueta;
+    # la lista plana no los trae, asi que se piden uno a uno solo si hacen falta.
+    data = gauth.api_get(f"{GMAIL}/labels", params={"includeAttributes": "false"})
+    out = []
+    for l in data.get("labels", []):
+        out.append(
             {
                 "id": l["id"],
                 "name": l["name"],
@@ -39,8 +44,11 @@ def gmail_list_labels() -> dict:
                 "total": l.get("messagesTotal"),
                 "unread": l.get("messagesUnread"),
             }
-            for l in data.get("labels", [])
-        ]
+        )
+    return {
+        "labels": out,
+        "nota": "total y unread vienen a null en la lista plana de Gmail; "
+        "usa gmail_search con 'label:X' para contar de verdad.",
     }
 
 
@@ -136,7 +144,15 @@ def _build_mime(to: str, subject: str, body: str, cc: str, bcc: str) -> str:
 
 
 def _headers_to_dict(m: dict) -> dict:
-    h = {k.lower(): v for k, v in (m.get("payload", {}).get("headers") or [])}
+    # Gmail devuelve payload.headers como lista de objetos {"name":..., "value":...},
+    # NO como pares [nombre, valor]. Iterar con "for k, v in headers" recorría las
+    # claves del dict ("name", "value") y construía {"name": "value"}, asi que todos
+    # los campos salian vacios. Hay que acceder por item["name"] / item["value"].
+    h = {}
+    for item in (m.get("payload") or {}).get("headers") or []:
+        name = str(item.get("name", "")).lower()
+        if name:
+            h[name] = item.get("value", "")
     return {
         "id": m.get("id"),
         "thread_id": m.get("threadId"),
@@ -215,9 +231,11 @@ def calendar_find_free_slots(days: int = 7, calendar_id: str = "primary", work_h
     days = max(1, min(int(days), 60))
     now = datetime.datetime.now(datetime.timezone.utc)
     end = now + datetime.timedelta(days=days)
-    data = gauth.api_get(
+    # freeBusy es POST-ONLY: acepta el cuerpo {items:[{id}]} y devuelve los
+    # tramos ocupados. Con GET devuelve 404. Por eso va por api_post y no api_get.
+    data = gauth.api_post(
         f"{CAL}/freeBusy",
-        params={
+        {
             "timeMin": now.isoformat().replace("+00:00", "Z"),
             "timeMax": end.isoformat().replace("+00:00", "Z"),
             "timeZone": "Europe/Madrid",

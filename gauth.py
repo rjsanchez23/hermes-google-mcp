@@ -24,14 +24,23 @@ CLIENT_PATH = CRED_DIR / "client_secret.json"
 AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
-# Scopes minimos: Gmail lectura+redaccion+envio, Calendar lectura+escritura,
-# Drive SOLO lectura. Ampliar drive a escritura es deliberado, no un olvido:
-# escribir en Drive es la accion mas destructiva de todo este servidor.
+# Scopes minimos, reducidos a proposito tras revisar la pantalla de consentimiento:
+#
+# - gmail.send FUERA. Es redundante: gmail.compose ya permite crear borradores Y
+#   enviar. Pedirlo solo anade una linea en la pantalla que dice "enviar correo".
+# - calendar (completo) FUERA. Ese permiso deja BORRAR CALENDARIOS ENTEROS, que es
+#   de lejos lo mas destructivo de esta lista y que este servidor no usa.
+#   calendar.readonly da ver calendarios, eventos y huecos; calendar.events da
+#   crear, editar y borrar EVENTOS. Entre los dos cubren todo lo que hace
+#   server.py y no permiten tocar los calendarios en si.
+# - drive.readonly: solo lectura. Escribir en Drive tampoco se usa.
+#
+# Para Ampliar algo hay que añadirlo aqui y reautorizar (setup_oauth.py --start).
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 

@@ -14,7 +14,9 @@ pequeno y se pierde con menus dinamicos como el de Composio).
 El token vive en credentials/token.json. El cliente MCP (Hermes) nunca ve OAuth.
 """
 
+import datetime
 import json
+import os
 import sys
 import traceback
 
@@ -22,7 +24,63 @@ import gauth
 import tools
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "google-workspace", "version": "1.0.0"}
+SERVER_INFO = {"name": "google-workspace", "version": "1.1.0"}
+
+# Rastro de acciones. El agente ha dicho "ya está guardado" tres veces sin haber
+# llamado a ninguna herramienta. Con este log, cualquier afirmación suya se
+# puede contrastar contra la realidad: si no aparece aqui, no ocurrió.
+AUDIT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit.log")
+
+# Herramientas que CAMBIAN algo en la cuenta del usuario. Se auditan siempre.
+WRITE_TOOLS = {
+    "gmail_send_email",
+    "gmail_create_draft",
+    "gmail_trash_email",
+    "calendar_create_event",
+    "calendar_delete_event",
+}
+
+
+def audit(tool: str, args: dict, result, is_error: bool) -> str:
+    """Una linea JSON por accion, en el servidor, que el agente no puede editar.
+    Devuelve un codigo unico que el agente debe copiar en su respuesta."""
+    rid = "no-auditado"
+    entry = {
+        "recibo": None,
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "tool": tool,
+        "args": _redact(args),
+        "ok": not is_error,
+    }
+    if isinstance(result, dict):
+        for k in ("event_id", "html_link", "message_id", "draft_id", "thread_id", "status"):
+            if k in result:
+                entry["result_" + k] = result[k]
+        if is_error:
+            entry["error"] = str(result.get("error", ""))[:200]
+    try:
+        import hashlib
+
+        semilla = entry["ts"] + tool + json.dumps(entry["args"], sort_keys=True)
+        rid = hashlib.sha256(semilla.encode()).hexdigest()[:10]
+        entry["recibo"] = rid
+        with open(AUDIT_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        os.chmod(AUDIT_PATH, 0o600)
+    except Exception as exc:  # el log nunca debe tumbar la herramienta
+        print(f"[google-workspace] no se pudo auditar: {exc}", file=sys.stderr)
+    return rid
+
+
+def _redact(args: dict) -> dict:
+    """No al bodies de correo en el log: pueden llevar datos personales."""
+    safe = {}
+    for k, v in (args or {}).items():
+        if k in ("body", "description"):
+            safe[k] = f"<{len(str(v))} chars, omitido>"
+        else:
+            safe[k] = v
+    return safe
 
 # --------------------------------------------------------------- catalogue
 # Nombres fijos y explicitos. El agente no tiene que "descubrir" nada.
@@ -280,22 +338,38 @@ def handle(req: dict) -> None:
             return
         try:
             result = fn(args)
+            if name in WRITE_TOOLS:
+                rid = audit(name, args, result, False)
+                if isinstance(result, dict):
+                    result = dict(result)
+                    result["_recibo"] = rid
+                    result["_como_usar"] = (
+                        "Copia este _recibo literal en tu respuesta. Es la unica prueba "
+                        "de que la accion ocurrio de verdad. Si no tienes un _recibo, "
+                        "NO la has hecho: no digas que si."
+                    )
             ok(req_id, {
                 "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=1)}],
                 "isError": False,
             })
         except gauth.AuthError as e:
+            if name in WRITE_TOOLS:
+                audit(name, args, {"error": str(e)}, True)
             ok(req_id, {
                 "content": [{"type": "text", "text": f"Error de autorizacion de Google: {e}"}],
                 "isError": True,
             })
         except ValueError as e:
+            if name in WRITE_TOOLS:
+                audit(name, args, {"error": str(e)}, True)
             ok(req_id, {
                 "content": [{"type": "text", "text": f"Argumentos incorrectos: {e}"}],
                 "isError": True,
             })
         except Exception as e:
             log(f"ERROR en {name}: {e}\n{traceback.format_exc()}")
+            if name in WRITE_TOOLS:
+                audit(name, args, {"error": f"{type(e).__name__}: {e}"}, True)
             ok(req_id, {
                 "content": [{"type": "text", "text": f"Error ejecutando {name}: {type(e).__name__}: {e}"}],
                 "isError": True,

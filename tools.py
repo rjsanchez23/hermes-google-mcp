@@ -8,7 +8,9 @@ decide el agente leyendo la descripcion de la herramienta, no este modulo.
 
 import base64
 import re
+import urllib.error
 import urllib.parse
+import urllib.request
 from zoneinfo import ZoneInfo
 
 import gauth
@@ -379,15 +381,24 @@ def calendar_create_event(
 
 
 def calendar_delete_event(event_id: str, calendar_id: str = "primary") -> dict:
+    # NO hacer "import urllib.request" aqui dentro: crea una variable local urllib
+    # que tapa el import de modulo hecho arriba, y rompe urllib.parse.quote con
+    # UnboundLocalError. El import va arriba, una sola vez.
     url = f"{CAL}/calendars/{urllib.parse.quote(calendar_id)}/events/{urllib.parse.quote(event_id)}"
-    import urllib.request
-
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + gauth.access_token()}, method="DELETE")
+    req = urllib.request.Request(
+        url, headers={"Authorization": "Bearer " + gauth.access_token()}, method="DELETE"
+    )
     try:
         with urllib.request.urlopen(req, timeout=45):
             pass
-    except Exception as e:
-        raise gauth.AuthError(f"No se pudo borrar el evento: {e}") from e
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise gauth.AuthError(
+                f"No existe el evento {event_id}. Puede que ya estuviera borrado."
+            ) from e
+        raise gauth.AuthError(f"No se pudo borrar el evento: API {e.code}") from e
+    except urllib.error.URLError as e:
+        raise gauth.AuthError(f"No se pudo contactar con Google: {e.reason}") from e
     return {"event_id": event_id, "status": "evento eliminado"}
 
 
